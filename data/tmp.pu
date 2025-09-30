@@ -1,0 +1,81 @@
+import numpy as np, pandas as pd, networkx as nx
+
+def prepare_consensus_subgraph(P: pd.DataFrame, thr=0.8, largest_cc=True):
+    A = P.values.copy()
+    np.fill_diagonal(A, 0.0)
+    A[A <= thr] = 0.0
+    G = nx.from_numpy_array(A)
+    name_map = dict(enumerate(P.index.tolist()))
+    G = nx.relabel_nodes(G, name_map)
+    if largest_cc and G.number_of_edges() > 0:
+        cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(cc).copy()
+    idx = list(G.nodes())
+    P_sub = nx.to_pandas_adjacency(G, nodelist=idx, weight='weight')
+    return P_sub, G
+
+# 用共識門檻 0.8 建圖 → 丟進你的 pipeline
+P_sub, G = prepare_consensus_subgraph(P, thr=0.8, largest_cc=True)
+partition = louvain_pipeline(P_sub)   # 例如 {'元大':0, '富邦':1, ...}
+
+
+def upper_mean_df(df: pd.DataFrame):
+    A = df.values
+    i, j = np.triu_indices_from(A, k=1)
+    v = A[i, j]
+    v = v[v > 0]
+    return float(v.mean()) if v.size else np.nan
+
+def intra_mean_df(df: pd.DataFrame, members: list):
+    if len(members) < 2: return np.nan
+    sub = df.loc[members, members]
+    return upper_mean_df(sub)
+
+# W_dict: {'W_jacc_warrant': df, ..., 'W_inv': df}（index/columns=分點名，與 P 對齊）
+def compute_lifts(W_dict: dict, partition: dict) -> pd.DataFrame:
+    lab = pd.Series(partition, name='comm')
+    nodes = lab.index
+    res = []
+    for cid, members in lab.groupby(lab).groups.items():
+        members = list(members)
+        for name, W in W_dict.items():
+            common_nodes = list(set(nodes) & set(W.index))
+            W_all = W.loc[common_nodes, common_nodes]
+            mu_all = upper_mean_df(W_all)
+            common_members = list(set(members) & set(W.index))
+            mu_in = intra_mean_df(W, common_members)
+            lift = (mu_in - mu_all) if (pd.notna(mu_in) and pd.notna(mu_all)) else np.nan
+            res.append({'community': int(cid), 'metric': name,
+                        'mu_in': mu_in, 'mu_all': mu_all, 'lift': lift})
+    return pd.DataFrame(res)
+
+lift_df = compute_lifts(W_dict, partition)
+
+
+import matplotlib.pyplot as plt
+
+order = ['W_jacc_warrant','W_jacc_underlying','W_inv',
+         'W_warrant_feature','W_co_net','W_co_volume','W_pc']
+
+def plot_lift_bars(lift_df: pd.DataFrame, save_dir=None):
+    for cid, sub in lift_df.groupby('community'):
+        s = sub.set_index('metric').reindex(order)['lift']
+        plt.figure(figsize=(8,4))
+        plt.axhline(0, linewidth=1)
+        plt.bar(s.index, s.values)
+        plt.xticks(rotation=20, ha='right')
+        plt.ylabel('lift = mu_in - mu_all')
+        plt.title(f'Community {cid} 群內提升')
+        top2 = s.sort_values(ascending=False).head(2)
+        for x, y in top2.items():
+            plt.text(x, y, 'Top', ha='center', va='bottom')
+        plt.tight_layout()
+        if save_dir:
+            plt.savefig(f'{save_dir}/community_{cid:03d}_lift_bar.png', dpi=200)
+        plt.show()
+
+plot_lift_bars(lift_df, save_dir='output/community_cards')
+
+
+pos = nx.spring_layout(G, weight='weight', seed=42)
+nx.draw(G, pos, with_labels=True, node_size=320, font_size=8)
