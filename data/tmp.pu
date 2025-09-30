@@ -79,3 +79,105 @@ plot_lift_bars(lift_df, save_dir='output/community_cards')
 
 pos = nx.spring_layout(G, weight='weight', seed=42)
 nx.draw(G, pos, with_labels=True, node_size=320, font_size=8)
+
+
+
+import numpy as np, networkx as nx, matplotlib.pyplot as plt
+from collections import defaultdict
+from matplotlib.font_manager import FontProperties
+
+# 設定可顯示中文（裝了就用，沒裝就退回系統字體）
+def get_zh_font():
+    for fam in ["Noto Sans CJK TC", "Microsoft JhengHei", "PingFang TC", "Heiti TC"]:
+        try:
+            return FontProperties(family=fam)
+        except: pass
+    return FontProperties()
+
+def contract_by_community(G, part):
+    """把同社群節點收縮成超節點，邊權=社群間權重總和"""
+    cg = nx.Graph()
+    comm_nodes = defaultdict(list)
+    for u,c in part.items(): comm_nodes[c].append(u)
+    # 節點：社群 id，size=群大小
+    for c,nodes in comm_nodes.items(): cg.add_node(c, size=len(nodes))
+    # 邊：社群間權重總和
+    for u,v,d in G.edges(data=True):
+        cu, cv = part[u], part[v]
+        if cu==cv: continue
+        w = d.get("weight",1.0)
+        cg.add_edge(cu, cv, weight=cg.get_edge_data(cu,cv,default={'weight':0})['weight']+w)
+    return cg, comm_nodes
+
+def community_cluster_layout(G, part, k_inner=0.5, k_outer=1.0, seed=42):
+    """群內 spring；群間對社群圖做 spring；回填偏移，讓同群聚在一起"""
+    cg, comm_nodes = contract_by_community(G, part)
+    # 群與群的中心位置
+    pos_comm = nx.spring_layout(cg, weight='weight', k=k_outer, seed=seed)
+    # 每群內部位置（局部 spring），再縮放到小圓內
+    pos = {}
+    rng = np.random.default_rng(seed)
+    for c, nodes in comm_nodes.items():
+        H = G.subgraph(nodes)
+        if H.number_of_edges()==0 and len(nodes)>1:
+            # 無邊時給個小圓
+            angles = np.linspace(0, 2*np.pi, len(nodes), endpoint=False)
+            inner = {n: np.array([np.cos(a), np.sin(a)])*0.2 for n,a in zip(nodes, angles)}
+        else:
+            inner = nx.spring_layout(H, weight='weight', k=k_inner, seed=seed)
+            # 正規化到半徑~0.25 的圓
+            X = np.array(list(inner.values()))
+            X = (X - X.mean(0))
+            if X.std() > 0: X = X / (X.std()*4)
+            inner = {n: X[i] for i,n in enumerate(H.nodes())}
+        center = np.array(pos_comm.get(c, rng.normal(size=2)))
+        for n in nodes:
+            pos[n] = center + inner[n]
+    return pos
+
+def plot_pretty_community(G, part, zh_font=None,
+                          intra_alpha=0.6, inter_alpha=0.12,
+                          inter_style='dashed', node_size=260, font_size=8):
+    if zh_font is None: zh_font = get_zh_font()
+    # 只畫最大連通塊，避免遠距孤點
+    if G.number_of_edges()>0:
+        cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(cc).copy()
+    # 位置：同群聚在一起
+    pos = community_cluster_layout(G, part, k_inner=0.4, k_outer=1.2, seed=42)
+
+    # 著色：依社群
+    comm_ids = sorted(set(part[n] for n in G.nodes()))
+    color_map = {c:i/ max(1,len(comm_ids)-1) for i,c in enumerate(comm_ids)}
+    node_colors = [color_map[part[n]] for n in G.nodes()]
+
+    # 分開畫群內/群間邊
+    intra_edges, inter_edges, w_intra, w_inter = [], [], [], []
+    for u,v,d in G.edges(data=True):
+        w = d.get('weight',1.0)
+        if part[u]==part[v]:
+            intra_edges.append((u,v)); w_intra.append(w)
+        else:
+            inter_edges.append((u,v)); w_inter.append(w)
+    # 邊寬做簡單縮放
+    def scale_ws(ws, base=1.0, mx=3.5):
+        if not ws: return []
+        a = np.array(ws, float); a = (a - a.min())/(a.ptp()+1e-9)
+        return list(base + a*(mx-base))
+
+    plt.figure(figsize=(9,6))
+    nx.draw_networkx_edges(G, pos, edgelist=inter_edges,
+                           width=scale_ws(w_inter, 0.5, 1.6),
+                           alpha=inter_alpha, style=inter_style)
+    nx.draw_networkx_edges(G, pos, edgelist=intra_edges,
+                           width=scale_ws(w_intra, 0.8, 3.2),
+                           alpha=intra_alpha)
+    nx.draw_networkx_nodes(G, pos, node_size=node_size,
+                           node_color=node_colors, cmap='tab10', linewidths=0.8, edgecolors='white')
+    nx.draw_networkx_labels(G, pos, fontproperties=zh_font, font_size=font_size)
+    plt.axis('off'); plt.tight_layout(); plt.show()
+
+# P_sub 為門檻後的共識鄰接矩陣（index/columns=分點名）
+partition = louvain_pipeline(P_sub)           # {'元大':0,'富邦':1,...}
+G = nx.from_pandas_adjacency(P_sub)
+plot_pretty_community(G, partition)
